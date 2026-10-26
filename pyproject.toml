@@ -1,7 +1,19 @@
 [project]
 name = "git-tasks-parser"
 version = "0.1.0"
-description = "Add your description here"
+description = "Export Git commits and issue keys to Excel"
 readme = "README.md"
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    "openpyxl>=3.1.5",
+]
+
+[project.scripts]
+git-tasks-parser = "main:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["main"]
