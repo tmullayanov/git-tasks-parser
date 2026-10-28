@@ -6,9 +6,9 @@ import re
 import subprocess
 import sys
 import tempfile
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime
-from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, BinaryIO
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
