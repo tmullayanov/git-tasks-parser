@@ -1,4 +1,4 @@
-"""Export commits reachable from one Git branch to an Excel workbook."""
+"""Export commits from Git repositories to one Excel workbook."""
 
 import argparse
 import os
@@ -6,21 +6,57 @@ import re
 import subprocess
 import sys
 import tempfile
+from dataclasses import dataclass
+from datetime import datetime
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, BinaryIO
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from openpyxl import Workbook
 from openpyxl.cell import WriteOnlyCell
 
-HEADERS = ("Commit hash", "Issue key", "author email")
+HEADERS = ("Commit hash", "Issue key", "author email", "Commit date", "repository name")
 MAX_EXCEL_ROWS = 1_048_576
+DATE_FORMAT = "yyyy-mm-dd hh:mm"
 ISSUE_KEY = re.compile(r"(?<![\w-])[A-Z][A-Z0-9_]+-[1-9][0-9]*(?![\w-])")
 HASH = re.compile(rb"[0-9a-f]{40}(?:[0-9a-f]{24})?")
 
 
 class ExportError(Exception):
     """An expected error that can be reported without a traceback."""
+
+
+@dataclass
+class Repository:
+    path: Path
+    name: str | None = None
+
+
+class RepoAction(argparse.Action):
+    def __call__(self, parser: argparse.ArgumentParser, namespace: argparse.Namespace, values: str, option_string: str | None = None) -> None:
+        repositories = getattr(namespace, self.dest, None)
+        if repositories is None:
+            repositories = []
+            setattr(namespace, self.dest, repositories)
+        repositories.append(Repository(Path(values)))
+        namespace._renameable = True
+
+
+class RepositoryNameAction(argparse.Action):
+    def __call__(self, parser: argparse.ArgumentParser, namespace: argparse.Namespace, values: str, option_string: str | None = None) -> None:
+        if not getattr(namespace, "_renameable", False):
+            parser.error("--repository-name must immediately follow its --repo")
+        if not values.strip():
+            parser.error("--repository-name cannot be empty")
+        namespace.repositories[-1].name = values
+        namespace._renameable = False
+
+
+class OtherOptionAction(argparse.Action):
+    def __call__(self, parser: argparse.ArgumentParser, namespace: argparse.Namespace, values: str, option_string: str | None = None) -> None:
+        setattr(namespace, self.dest, values)
+        namespace._renameable = False
 
 
 def git(repo: Path, *args: str) -> subprocess.CompletedProcess[bytes]:
@@ -68,10 +104,10 @@ def split_nul_fields(stream: BinaryIO) -> Iterator[bytes]:
         raise ExportError("Incomplete Git log output")
 
 
-def commits(repo: Path, commit: str) -> Iterator[tuple[str, str, str]]:
+def commits(repo: Path, commit: str) -> Iterator[tuple[str, str, datetime, str]]:
     command = [
         "git", "-C", str(repo), "log", "--topo-order", "--no-use-mailmap",
-        "--no-patch", "--format=%H%x00%ae%x00%B%x00", commit,
+        "--no-patch", "--encoding=UTF-8", "--format=%H%x00%ae%x00%cI%x00%B%x00", commit,
     ]
     try:
         process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -83,16 +119,23 @@ def commits(repo: Path, commit: str) -> Iterator[tuple[str, str, str]]:
         fields = []
         for field in split_nul_fields(process.stdout):
             fields.append(field)
-            if len(fields) != 3:
+            if len(fields) != 4:
                 continue
-            raw_hash, raw_email, raw_message = fields
+            raw_hash, raw_email, raw_date, raw_message = fields
             fields = []
             raw_hash = raw_hash.lstrip(b"\r\n")
             if not HASH.fullmatch(raw_hash):
                 raise ExportError("Unexpected Git log output: invalid commit hash")
+            try:
+                commit_date = datetime.fromisoformat(raw_date.decode("ascii"))
+            except (UnicodeError, ValueError) as exc:
+                raise ExportError("Unexpected Git log output: invalid commit date") from exc
+            if commit_date.tzinfo is None:
+                raise ExportError("Unexpected Git log output: commit date has no time zone")
             yield (
                 raw_hash.decode("ascii"),
                 raw_email.decode("utf-8", errors="replace"),
+                commit_date,
                 raw_message.decode("utf-8", errors="replace"),
             )
         if fields:
@@ -113,12 +156,33 @@ def text_cell(sheet: Any, value: str) -> Any:
     return cell
 
 
-def export(repo: Path, branch: str, output: Path) -> int:
-    commit = resolve_branch(repo, branch)
+def export(repositories: list[Repository], branch: str, timezone: str, output: Path) -> int:
+    if not repositories:
+        raise ExportError("At least one repository is required")
+    try:
+        zone = ZoneInfo(timezone)
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise ExportError(f"Unknown IANA time zone: {timezone}") from exc
     if output.suffix.lower() != ".xlsx":
         raise ExportError("Output file must have the .xlsx extension")
     if output.exists():
         raise ExportError(f"Output file already exists: {output}")
+
+    selected = []
+    names = set()
+    for repository in repositories:
+        path = repository.path.resolve()
+        name = repository.name if repository.name is not None else path.name
+        if not name.strip():
+            raise ExportError(f"Repository name cannot be empty: {path}")
+        if name.casefold() in names:
+            raise ExportError(f"Duplicate repository name: {name}")
+        names.add(name.casefold())
+        try:
+            commit = resolve_branch(path, branch)
+        except ExportError as exc:
+            raise ExportError(f"{path}: {exc}") from exc
+        selected.append((path, name, commit))
 
     workbook = Workbook(write_only=True)
     sheet = workbook.create_sheet("Commits")
@@ -126,13 +190,23 @@ def export(repo: Path, branch: str, output: Path) -> int:
     row_count = 1
     temp_path = None
     try:
-        for commit_hash, email, message in commits(repo, commit):
-            keys = dict.fromkeys(ISSUE_KEY.findall(message))
-            for key in keys or {"": None}:
-                if row_count >= MAX_EXCEL_ROWS:
-                    raise ExportError(f"Excel sheet limit exceeded ({MAX_EXCEL_ROWS} rows)")
-                sheet.append([text_cell(sheet, value) for value in (commit_hash, key, email)])
-                row_count += 1
+        for path, name, commit in selected:
+            try:
+                for commit_hash, email, commit_date, message in commits(path, commit):
+                    local_date = commit_date.astimezone(zone).replace(tzinfo=None)
+                    keys = dict.fromkeys(ISSUE_KEY.findall(message))
+                    for key in keys or {"": None}:
+                        if row_count >= MAX_EXCEL_ROWS:
+                            raise ExportError(f"Excel sheet limit exceeded ({MAX_EXCEL_ROWS} rows)")
+                        date_cell = WriteOnlyCell(sheet, value=local_date)
+                        date_cell.number_format = DATE_FORMAT
+                        sheet.append([
+                            text_cell(sheet, commit_hash), text_cell(sheet, key),
+                            text_cell(sheet, email), date_cell, text_cell(sheet, name),
+                        ])
+                        row_count += 1
+            except ExportError as exc:
+                raise ExportError(f"{path}: {exc}") from exc
 
         fd, filename = tempfile.mkstemp(prefix=".git-tasks-parser-", suffix=".xlsx", dir=output.parent)
         os.close(fd)
@@ -155,12 +229,14 @@ def export(repo: Path, branch: str, output: Path) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--repo", type=Path, required=True, help="Local Git repository")
-    parser.add_argument("--main-branch", required=True, metavar="REF", help="Local branch name or full remote-tracking ref")
-    parser.add_argument("--output", type=Path, required=True, help="New .xlsx file")
+    parser.add_argument("--repo", dest="repositories", action=RepoAction, required=True, metavar="PATH", help="Local Git repository; repeat for several")
+    parser.add_argument("--repository-name", action=RepositoryNameAction, metavar="NAME", help="Name for the immediately preceding --repo")
+    parser.add_argument("--main-branch", action=OtherOptionAction, required=True, metavar="REF", help="Local branch name or full remote-tracking ref")
+    parser.add_argument("--timezone", action=OtherOptionAction, required=True, metavar="ZONE", help="IANA time zone for commit dates")
+    parser.add_argument("--output", action=OtherOptionAction, type=Path, required=True, help="New .xlsx file")
     args = parser.parse_args()
     try:
-        count = export(args.repo, args.main_branch, args.output)
+        count = export(args.repositories, args.main_branch, args.timezone, args.output)
     except ExportError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
